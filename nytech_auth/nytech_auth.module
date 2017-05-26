@@ -1,0 +1,197 @@
+<?php
+
+function is_staff() {
+	global $user;
+	$bool = FALSE;
+	if(is_array($user->roles)) {
+		if(in_array('administrator', $user->roles)) {
+			$bool = TRUE;	
+		}
+	}
+	
+	return $bool;
+}
+
+function nytech_auth_menu() {
+    $items = array();
+    $items['api/v1/auth'] = array(
+        'page callback' => 'nytech_api_auth',
+        'access callback' => TRUE,
+        'delivery callback' => 'drupal_json_output' ,
+    );
+	$items['api/v1/logout/%'] = array(
+        'page callback' => 'nytech_api_logout',
+        'access callback' => 'nytech_auth_callback',
+        'delivery callback' => 'drupal_json_output',
+        'page arguments' => array(3),
+    );
+	
+	return $items;
+}
+
+function auth_defaults($status = NULL, $uid = NULL, $message = NULL) {
+	/*
+	 * Setting defaults
+	 */
+	if(!$status) {
+		$status = 401;
+	}
+	
+	
+	// default to 0 for the user
+	if(!$uid) {
+		$uid = 0;
+	}
+	
+	if(!$message) {
+		$message = 'Not authenticated';
+	}
+	
+	$output = array(
+		'status' => $status,
+		'uid' => $uid,
+		'message' => $message,
+	);
+	
+	return $output;
+}
+
+function nytech_api_auth() {
+	// the wrapper function for auth endpoint
+	$output = auth_defaults();
+	$auth = get_header();
+	if(!empty($auth)) {
+		if(in_array('basic', $auth)) {
+			$output = nytech_auth_user($auth);
+			$output['features']['consults'] = 0;
+			$output['data'] = get_nytech_user($output['uid'], NULL);
+		} elseif(in_array('session', $auth)) {
+			$sid = $auth['sid'];
+			$output = nytech_api_auth_session($sid);
+			$output['features']['consults'] = 0;
+			$output['sid'] = $sid;
+		}
+	}
+	
+	
+	$output['payment_status'] = 'test';
+	
+	return $output;
+}
+
+function nytech_api_auth_session($sid) {
+	$output = auth_defaults(NULL, NULL, 'Invalid session.');
+	$query = 'SELECT s.uid FROM {sessions} s WHERE s.sid = :sid';
+	$args = array(
+		':sid' => $sid,
+	);
+	$result = db_query($query, $args);
+	foreach ($result as $record) {
+		$output = array(
+			'status' => 200,
+			'message' => 'OK',
+			'uid' => $record->uid,
+			'sid' => $sid,
+		);
+	}
+	return $output;
+}
+
+function get_header() {
+	$output = '';
+	if(!empty($_SERVER['HTTP_AUTHORIZATION'])) {
+		if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+			$base64 = substr($_SERVER['HTTP_AUTHORIZATION'],6);
+			$user_pass_string = base64_decode($base64);
+			$output = list($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW']) = explode(':', $user_pass_string);
+			$output['auth_type'] = 'basic';
+		}
+	} elseif(!empty($_SERVER['HTTP_NYTECHSID'])) {
+		$output = array(
+			'sid' => $_SERVER['HTTP_NYTECHSID'],
+			'auth_type' => 'session',
+		);
+	}
+	return $output;
+}
+
+/*
+ * Pass the $auth = get_header() function into this function.
+ * $auth will have user then pass in the array.
+ * OR
+ * $auth will have the $sid in the array.
+ */
+function nytech_auth_user($auth) {
+	// $output = array(
+		// 'status' => 401,
+		// 'message' => 'Invalid session.',
+	// );
+	$output = auth_defaults(401, 0, 'Invalid session.');
+	$user = $auth[0];
+	$pass = $auth[1];
+	$uid = user_authenticate($user, $pass);
+	if ($uid > 0) {
+		$account = array('uid' => $uid);
+		user_login_submit(array(), $account);
+		global $user;
+		
+		$output = array(
+			'status' => 200,
+	     	'message' => 'You have logged in!',
+	     	'sid' => session_id(),
+	     	'uid' => $uid,
+	     	'auth_type' => 'basic SUCCESS',
+		);
+	}
+	
+	return $output;
+}
+
+function nytech_api_logout($sid) {
+	
+	// $output = array(
+		// 'status' => 200,
+		// 'message' => 'User was already logged out',
+	// );
+	
+	$output = auth_defaults(NULL, NULL, 'User was already logged out');
+	
+	$sid_auth_array = nytech_api_auth_session($sid);
+	if(!empty($sid_auth_array['uid']) and is_numeric($sid_auth_array['uid'])) {
+		$uid = $sid_auth_array['uid'];
+		$user = user_load($uid);
+		$tmp = NULL;
+		session_destroy();
+		user_module_invoke('logout', $tmp, $user);
+		$user = drupal_anonymous_user();
+		$output = array(
+			'status' => 200,
+	     	'message' => 'You have been logged out.',
+		);
+	}
+	
+	
+	return $output;
+}
+
+/*
+ * Use this for 'access callback' => 'nytech_auth_callback' in any module.
+ * Euther pass basic auth in the header or pass the $sid in the header as NYTECHSID.
+ * The result will be TRUE if auth passes or FALSE if auth failed.
+ */
+function nytech_auth_callback() {
+	$output = FALSE;
+	$auth = nytech_api_auth();
+	if(!empty($auth['status']) && $auth['status'] == 200) {
+		$output = TRUE;
+	}
+	return $output;
+}
+
+function if_auth_then_data($auth, $data) {
+	if($auth['status'] == 200) {
+		return $data;
+	} else {
+		return NULL;
+	}
+}
