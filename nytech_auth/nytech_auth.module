@@ -1,197 +1,487 @@
 <?php
 
-function is_staff() {
-	global $user;
-	$bool = FALSE;
-	if(is_array($user->roles)) {
-		if(in_array('administrator', $user->roles)) {
-			$bool = TRUE;	
-		}
-	}
-	
-	return $bool;
-}
+/*
+ * The nytech_auth module is responsible for:
+ * 1. Authenticating users through Auth/BasicAuth/SessionAuth classes.
+ * 2. Generating the tope level payloads, errors, sataus, data, and elements.
+ * 3. Loading the data payload through the class Callback.
+ */
 
+/*
+ * hook_menu
+ */
 function nytech_auth_menu() {
     $items = array();
     $items['api/v1/auth'] = array(
-        'page callback' => 'nytech_api_auth',
+        'page callback' => 'endpoint_auth',
         'access callback' => TRUE,
-        'delivery callback' => 'drupal_json_output' ,
-    );
-	$items['api/v1/logout/%'] = array(
-        'page callback' => 'nytech_api_logout',
-        'access callback' => 'nytech_auth_callback',
         'delivery callback' => 'drupal_json_output',
-        'page arguments' => array(3),
+        'file' => 'nytech_auth.inc',
+		'file path' => drupal_get_path('module', 'nytech_auth') . '/inc',
+    );
+	$items['api/v1/logout'] = array(
+        'page callback' => 'endpoint_logout',
+        'access callback' => TRUE,
+        'delivery callback' => 'drupal_json_output',
+        'file' => 'nytech_auth.inc',
+		'file path' => drupal_get_path('module', 'nytech_auth') . '/inc',
     );
 	
 	return $items;
 }
 
-function auth_defaults($status = NULL, $uid = NULL, $message = NULL) {
-	/*
-	 * Setting defaults
-	 */
-	if(!$status) {
-		$status = 401;
-	}
-	
-	
-	// default to 0 for the user
-	if(!$uid) {
-		$uid = 0;
-	}
-	
-	if(!$message) {
-		$message = 'Not authenticated';
-	}
-	
-	$output = array(
-		'status' => $status,
-		'uid' => $uid,
-		'message' => $message,
-	);
-	
-	return $output;
-}
-
-function nytech_api_auth() {
-	// the wrapper function for auth endpoint
-	$output = auth_defaults();
-	$auth = get_header();
-	if(!empty($auth)) {
-		if(in_array('basic', $auth)) {
-			$output = nytech_auth_user($auth);
-			$output['features']['consults'] = 0;
-			$output['data'] = get_nytech_user($output['uid'], NULL);
-		} elseif(in_array('session', $auth)) {
-			$sid = $auth['sid'];
-			$output = nytech_api_auth_session($sid);
-			$output['features']['consults'] = 0;
-			$output['sid'] = $sid;
-		}
-	}
-	
-	
-	$output['payment_status'] = 'test';
-	
-	return $output;
-}
-
-function nytech_api_auth_session($sid) {
-	$output = auth_defaults(NULL, NULL, 'Invalid session.');
-	$query = 'SELECT s.uid FROM {sessions} s WHERE s.sid = :sid';
-	$args = array(
-		':sid' => $sid,
-	);
-	$result = db_query($query, $args);
-	foreach ($result as $record) {
-		$output = array(
-			'status' => 200,
-			'message' => 'OK',
-			'uid' => $record->uid,
-			'sid' => $sid,
-		);
-	}
-	return $output;
-}
-
-function get_header() {
-	$output = '';
-	if(!empty($_SERVER['HTTP_AUTHORIZATION'])) {
-		if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
-			$base64 = substr($_SERVER['HTTP_AUTHORIZATION'],6);
-			$user_pass_string = base64_decode($base64);
-			$output = list($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW']) = explode(':', $user_pass_string);
-			$output['auth_type'] = 'basic';
-		}
-	} elseif(!empty($_SERVER['HTTP_NYTECHSID'])) {
-		$output = array(
-			'sid' => $_SERVER['HTTP_NYTECHSID'],
-			'auth_type' => 'session',
-		);
-	}
-	return $output;
-}
-
 /*
- * Pass the $auth = get_header() function into this function.
- * $auth will have user then pass in the array.
- * OR
- * $auth will have the $sid in the array.
+ * This is the primary Payload Manager for all endpoint responces.
+ * $status is the $code and $message for the endpoint.
+ * $errors is not complete but will hold an array of error objects.
+ * $elements is not used at this time but can include SyNT style object arrays to be rendered.
+ * $data is the information payload.
  */
-function nytech_auth_user($auth) {
-	// $output = array(
-		// 'status' => 401,
-		// 'message' => 'Invalid session.',
-	// );
-	$output = auth_defaults(401, 0, 'Invalid session.');
-	$user = $auth[0];
-	$pass = $auth[1];
-	$uid = user_authenticate($user, $pass);
-	if ($uid > 0) {
-		$account = array('uid' => $uid);
-		user_login_submit(array(), $account);
-		global $user;
+class Responce {
+	public $status;
+	public $errors;
+	public $elements;
+	public $data;
+	
+	function __construct($callback) {
+		// Auth stuff
+		$auth = new Auth;
+		if($auth->access == TRUE) {			
+			$status = new Status(200, 'OK');
+		}  else {
+			$status = new Status;
+		}
+		$this->set_status($status);
 		
-		$output = array(
-			'status' => 200,
-	     	'message' => 'You have logged in!',
-	     	'sid' => session_id(),
-	     	'uid' => $uid,
-	     	'auth_type' => 'basic SUCCESS',
-		);
+		// Callback stuff
+		if(isset($callback)) {
+			$newData = new Callback($callback, $auth);
+			if(!empty($newData->data)) {
+				$this->set_data($newData->data);
+				if($newData->data->status) {
+					
+					$new_status = $newData->data->status;
+					$this->set_status($new_status);
+					unset($newData->data->status);
+				}
+			} else {
+				$new_data = array(
+					'label' => 'There is no data for this request.',
+				);
+				$this->set_data($new_data);
+			}
+			
+			
+		}
+		
 	}
 	
-	return $output;
+	public function set_status($status) {
+		$this->status = $status;
+	}
+	
+	public function get_status() {
+		return $this->status;
+	}
+	
+	public function set_data($new_data) {
+		
+		if(!empty($new_data->status)) {
+			$this->data = $new_data;
+			$new_status = new Status($new_data->status);
+			//unset($new_data->status);
+		} else {		
+			$this->data = $new_data;
+		}
+	}
+	
+	public function get_data() {
+		return $this->data;
+	}
+	
+	
 }
 
-function nytech_api_logout($sid) {
+
+/*
+ * Status class holds the api $status responce object. 200, ok. 401, not auth, etc.
+ */
+class Status {
+	public $code = 401;
+	public $message = 'Please Authenticated';
 	
-	// $output = array(
-		// 'status' => 200,
-		// 'message' => 'User was already logged out',
-	// );
-	
-	$output = auth_defaults(NULL, NULL, 'User was already logged out');
-	
-	$sid_auth_array = nytech_api_auth_session($sid);
-	if(!empty($sid_auth_array['uid']) and is_numeric($sid_auth_array['uid'])) {
-		$uid = $sid_auth_array['uid'];
-		$user = user_load($uid);
-		$tmp = NULL;
-		session_destroy();
-		user_module_invoke('logout', $tmp, $user);
-		$user = drupal_anonymous_user();
-		$output = array(
-			'status' => 200,
-	     	'message' => 'You have been logged out.',
-		);
+	function __construct($new_code, $new_message) {
+		if(isset($new_code)) {
+			$this->set_code($new_code);
+		}
+
+		if(!empty($new_message)) {
+			$this->set_message($new_message);
+		}
 	}
 	
+	public function set_code($code) {
+		$this->code = $code;
+	}
 	
-	return $output;
+	public function get_code() {
+		return $this->code;
+	}
+	
+	public function set_message($message) {
+		$this->message = $message;
+	}
+	
+	public function get_message() {
+		return $this->message;
+	}
+}
+ 
+/*
+ * Errors are generated if/when the status is not 200. This is not completed.
+ */
+class Error {
+	public $code;
+	public $message;
+	
+	
+	function __construct() {
+		
+	}
+	
+	public function set_code($code) {
+		$this->code = $code;
+	}
+	
+	public function get_code() {
+		return $this->code;
+	}
+	
+	public function set_message($message) {
+		$this->message = $message;
+	}
+	
+	public function get_message() {
+		return $this->message;
+	}
+	
 }
 
 /*
- * Use this for 'access callback' => 'nytech_auth_callback' in any module.
- * Euther pass basic auth in the header or pass the $sid in the header as NYTECHSID.
- * The result will be TRUE if auth passes or FALSE if auth failed.
+ * Auth is the class that authenticates the user and returns data related to that auth.
  */
-function nytech_auth_callback() {
-	$output = FALSE;
-	$auth = nytech_api_auth();
-	if(!empty($auth['status']) && $auth['status'] == 200) {
-		$output = TRUE;
+class Auth {
+	public $access;
+	public $id;
+	public $sid;
+	public $type;
+		
+	function __construct() {
+		$auth = new GetHeader;
+		if(!empty($auth)) {
+			if($auth->type == 'basic') {
+				$auth = new BasicAuth($auth);
+			} elseif($auth->type == 'sid') {
+				$auth = new SessionAuth($auth);
+			}
+		}
+		
+		
+		if($auth->id > 0) {
+			$this->set_access(TRUE);
+			$this->set_id($auth->id);
+			$this->set_sid($auth->sid);
+			$this->set_type($auth->type);			
+		} else {
+			$this->set_access(FALSE);
+			unset($this->id);
+			unset($this->sid);
+			unset($this->type);
+		}
+		
 	}
-	return $output;
+	
+	// $access
+	private function set_access($access) {
+		$this->access = $access;
+	}
+	
+	private function get_access() {
+		return $this->access;
+	}
+	
+	// sid
+	private function set_sid($sid) {
+		$this->sid = $sid;
+	}
+	
+	private function get_sid() {
+		return $this->sid;
+	}
+	
+	// $id
+	private function set_id($id) {
+		$this->id = $id;
+	}
+	
+	private function get_id() {
+		return $this->id;
+	}
+	
+	// $type	
+	private function set_type($type) {
+		$this->type = $type;
+	}
+	
+	private function get_type() {
+		return $this->type;
+	}
+	
 }
 
-function if_auth_then_data($auth, $data) {
-	if($auth['status'] == 200) {
-		return $data;
-	} else {
-		return NULL;
+/*
+ * BasicAuth loggs the user in if using user/pass combo that is base64 encoded and sent
+ * within the header as "Authenticate" => "string...".
+ */
+class BasicAuth {
+	public $id;
+	public $sid;
+	public $type = 'basic';
+	function __construct($auth) {
+		$user = $auth->basic[0];
+		$pass = $auth->basic[1];
+		(int) $id = user_authenticate($user, $pass);
+		if ($id > 0) {
+			$account = array('uid' => $id);
+			user_login_submit(array(), $account);
+			global $user;
+			
+			$sid = session_id();
+			$this->set_id($id);
+			$this->set_sid($sid);
+		}
 	}
+	
+	private function set_id($id) {
+		$this->id = (int) $id;
+	}
+	
+	private function get_id() {
+		return $this->id;
+	}
+	
+	private function set_sid($sid) {
+		$this->sid = $sid;
+	}
+	
+	private function get_sid() {
+		return $this->sid;
+	}
+}
+
+/*
+ * SessionAuth is the method to authenticate a user if they have a $sid that is valid and current.
+ */
+class SessionAuth {
+	public $id;
+	public $sid;
+	public $type = 'sid';
+	
+	function __construct($auth) {
+		$sid = $auth->sid;
+		$query = 'SELECT s.uid FROM {sessions} s WHERE s.sid = :sid';
+		$args = array(
+			':sid' => $sid,
+		);
+		$result = db_query($query, $args);
+		foreach ($result as $record) {
+			$this->set_sid($sid);
+			$this->set_id($record->uid);
+		}
+		return $output;
+	}
+	
+	private function set_id($id) {
+		$this->id = (int) $id;
+	}
+	
+	private function get_id() {
+		return $this->id;
+	}
+	
+	private function set_sid($sid) {
+		$this->sid = $sid;
+	}
+	
+	private function get_sid() {
+		return $this->sid;
+	}
+}
+
+class SessionLogout {
+		
+	public $label;
+	public $status;
+	
+	function __construct($auth, $variables) {
+		if($auth->id > 0) {
+			$user = user_load($auth->id);
+			$tmp = NULL;
+			session_destroy();
+			user_module_invoke('logout', $tmp, $user);
+			$new_label = 'You have been logged out';
+			$new_status = new Status(401, $new_message);
+			$this->set_label($new_label);
+			$this->set_status($new_status);
+		}
+	}
+	
+	public function set_label($new_label) {
+		$this->label = $new_label;
+	}
+	
+	public function get_label() {
+		return $this->label;
+	}
+	
+	public function set_status($new_status) {
+		$this->status = $new_status;
+	}
+	
+	public function get_status() {
+		return $this->status;
+	}
+}
+
+/*
+ * GetHeader grabs the auth info if it is either "sid" or "basic auth".
+ */
+class GetHeader {
+	public $sid;
+	public $type;
+	public $basic;
+	
+	function __construct() {
+		if(!empty($_SERVER['HTTP_AUTHORIZATION'])) {
+			if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+				$base64 = substr($_SERVER['HTTP_AUTHORIZATION'],6);
+				$user_pass_string = base64_decode($base64);
+				$basic = list($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW']) = explode(':', $user_pass_string);
+				$this->set_basic($basic);
+				$this->set_type('basic');
+				unset($this->sid);
+			}
+		} elseif(!empty($_SERVER['HTTP_SID'])) {
+			$sid = $_SERVER['HTTP_SID'];
+			$this->set_sid($sid);
+			$this->set_type('sid');
+			unset($this->basic);
+		} else {
+			unset($this->basic);
+			unset($this->sid);
+			unset($this->type);
+		}
+	}
+
+	private function set_basic($basic) {
+		$this->basic = $basic;
+	}
+	
+	private function get_basic() {
+		return $this->basic;
+	}
+	
+	private function set_sid($sid) {
+		$this->sid = $sid;
+	}
+	
+	private function get_sid() {
+		return $this->sid;
+	}
+	
+	private function set_type($type) {
+		$this->type = $type;
+	}
+	
+	private function get_type() {
+		return $this->type;
+	}
+}
+
+/*
+ * Callback fires a class (if it exists) and returns the information in the Responce class
+ * as the "data" payload. This is experimental... at best :)
+ */
+class Callback {
+	public $callback_string;
+	public $variables;
+	public $data;
+	public $auth;
+	public $stats = array();
+	
+	function __construct($callback, $auth) {
+		if(isset($callback['callback'])) {
+			$this->set_callback_string($callback['callback']);
+		}
+		if(!empty($callback['variables'])) {
+			$this->set_variables($callback['variables']);
+		}
+		
+		$this->set_auth($auth);
+		
+		if(!empty($this->callback_string)) {
+			if(class_exists($this->callback_string)) {
+				$callback = $this->callback_string;
+				$newData = new $callback($auth, $this->get_variables());				
+				$this->set_data($newData);
+			}
+			
+		}
+	}
+	
+	// Callback string
+	private function set_callback_string($callback) {
+		$this->callback_string = $callback;
+	}
+	
+	private function get_callback_string() {
+		return $this->callback_string;
+	}
+	
+	// Variables
+	private function set_variables($variables) {
+		$this->variables = $variables;
+	}
+	
+	private function get_variables() {
+		return $this->variables;
+	}
+	
+	// Data
+	private function set_data($data) {
+		$this->data = $data;
+	}
+	
+	private function get_data() {
+		return $this->data;
+	}
+	
+	// Auth. to be used incase the Callback class needs a user id.
+	private function set_auth($auth) {
+		$this->auth = $auth;
+	}
+	
+	private function get_auth() {
+		return $this->auth;
+	}
+	
+	private function set_status($new_status) {
+		$this->status = $new_status;
+	}
+	
+	private function get_status() {
+		return $this->status;
+	}
+	
+	
 }
